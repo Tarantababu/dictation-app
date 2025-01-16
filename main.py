@@ -146,6 +146,8 @@ def get_next_card(deck: List[Dict]) -> Dict:
     # In a full implementation, you'd want to sort by due date and handle new vs review cards
     return deck[0]
 
+# [Previous imports remain the same until the main() function]
+
 def main():
     st.set_page_config(page_title="🎧 Listening Practice", layout="wide")
     init_session_state()
@@ -163,7 +165,7 @@ def main():
                     st.session_state.logged_in = True
                     st.session_state.username = username
                     st.session_state.progress = load_user_data(username)
-                    st.experimental_rerun()
+                    st.rerun()  # Updated from experimental_rerun()
                 else:
                     st.error("❌ Invalid credentials")
         return
@@ -177,7 +179,8 @@ def main():
     
     if uploaded_file:
         try:
-            with st.sidebar.spinner("Processing deck..."):
+            # Using regular spinner instead of sidebar spinner
+            with st.spinner("Processing deck..."):
                 cards = parse_anki_deck(uploaded_file)
                 if cards:
                     deck_name = uploaded_file.name.replace('.apkg', '')
@@ -187,12 +190,14 @@ def main():
             st.sidebar.error(f"Error uploading deck: {str(e)}")
     
     # Deck Selection
-    if st.session_state.decks:
-        selected_deck = st.sidebar.selectbox(
-            "Select Deck",
-            options=list(st.session_state.decks.keys())
-        )
-        st.session_state.current_deck = selected_deck
+    if hasattr(st.session_state, 'decks') and st.session_state.decks:  # Added hasattr check
+        deck_options = list(st.session_state.decks.keys())
+        if deck_options:  # Added check for non-empty list
+            selected_deck = st.sidebar.selectbox(
+                "Select Deck",
+                options=deck_options
+            )
+            st.session_state.current_deck = selected_deck
     
     daily_new = st.sidebar.number_input("New cards per day", 1, 50, 20)
     daily_review = st.sidebar.number_input("Review cards per day", 1, 100, 50)
@@ -206,7 +211,7 @@ def main():
     # Main practice area
     st.markdown("# 🎧 Listening Practice")
     
-    if not st.session_state.current_deck:
+    if not hasattr(st.session_state, 'current_deck') or not st.session_state.current_deck:
         st.info("👆 Please upload and select an Anki deck to start practicing!")
         return
     
@@ -214,7 +219,10 @@ def main():
     
     with col1:
         st.markdown("### Current Card")
-        if st.session_state.current_deck and st.session_state.decks[st.session_state.current_deck]:
+        if (hasattr(st.session_state, 'current_deck') and 
+            st.session_state.current_deck and 
+            st.session_state.decks.get(st.session_state.current_deck)):
+            
             current_card = get_next_card(st.session_state.decks[st.session_state.current_deck])
             
             if current_card:
@@ -222,7 +230,6 @@ def main():
                 
                 if current_card['audio_file']:
                     if st.button("▶️ Play Audio"):
-                        # Here you would implement actual audio playback
                         st.info(f"Audio file: {current_card['audio_file']}")
                 
                 user_input = st.text_area("Type what you hear:", height=100)
@@ -243,7 +250,7 @@ def main():
         progress = st.session_state.daily_stats['reviewed'] / daily_review
         st.progress(progress)
         
-        if st.session_state.current_deck:
+        if hasattr(st.session_state, 'current_deck') and st.session_state.current_deck:
             st.markdown("### Deck Statistics")
             total_cards = len(st.session_state.decks[st.session_state.current_deck])
             st.metric("Total Cards", total_cards)
