@@ -10,74 +10,95 @@ import zipfile
 import io
 from typing import Dict, List, Tuple
 import os
+import tempfile
+import shutil
 
 # Add Anki deck parsing functionality
 def parse_anki_deck(uploaded_file) -> List[Dict]:
     """Parse uploaded Anki deck (.apkg file) and extract cards"""
     cards = []
     
-    # Create a temporary directory to extract the .apkg file
-    temp_dir = "temp_anki"
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    try:
-        # Extract the .apkg file (which is a SQLite database)
-        with zipfile.ZipFile(uploaded_file, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
-        
-        # Connect to the SQLite database
-        conn = sqlite3.connect(f"{temp_dir}/collection.anki2")
-        cursor = conn.cursor()
-        
-        # Get notes (cards) from the database
-        cursor.execute("""
-            SELECT notes.id, notes.flds, notes.tags, cards.due 
-            FROM notes 
-            JOIN cards ON cards.nid = notes.id
-        """)
-        
-        for row in cursor.fetchall():
-            note_id, fields, tags, due = row
-            # Split fields (typically separated by \x1f character in Anki)
-            fields_list = fields.split('\x1f')
+    # Create a temporary directory using tempfile
+    with tempfile.TemporaryDirectory() as temp_dir:
+        try:
+            # Save the uploaded file to a temporary file
+            temp_apkg_path = os.path.join(temp_dir, "temp.apkg")
+            with open(temp_apkg_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
             
-            # Assuming first field is front (sentence + audio) and second is back (translation)
-            if len(fields_list) >= 2:
-                # Extract audio file name if present (Anki stores audio references like [sound:filename.mp3])
-                front = fields_list[0]
-                audio_file = None
-                if '[sound:' in front:
-                    import re
-                    audio_match = re.search(r'\[sound:(.*?)\]', front)
-                    if audio_match:
-                        audio_file = audio_match.group(1)
-                        front = re.sub(r'\[sound:.*?\]', '', front).strip()
+            # Extract the .apkg file
+            with zipfile.ZipFile(temp_apkg_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_dir)
+            
+            # Check if collection.anki2 exists
+            collection_path = os.path.join(temp_dir, "collection.anki2")
+            if not os.path.exists(collection_path):
+                st.error("Invalid Anki deck file: collection.anki2 not found")
+                return []
+            
+            # Connect to the SQLite database
+            conn = sqlite3.connect(collection_path)
+            cursor = conn.cursor()
+            
+            try:
+                # Get notes (cards) from the database
+                cursor.execute("""
+                    SELECT notes.id, notes.flds, notes.tags
+                    FROM notes
+                """)
                 
-                cards.append({
-                    'id': note_id,
-                    'front': front,
-                    'back': fields_list[1],
-                    'audio_file': audio_file,
-                    'tags': tags,
-                    'due': due
-                })
-        
-        conn.close()
-        
-        # Also extract media files
-        if os.path.exists(f"{temp_dir}/media"):
-            with open(f"{temp_dir}/media", 'r') as f:
-                media_dict = json.load(f)
-                # TODO: Process media files if needed
-    
-    except Exception as e:
-        st.error(f"Error parsing Anki deck: {str(e)}")
-        cards = []
-    
-    finally:
-        # Cleanup
-        import shutil
-        shutil.rmtree(temp_dir, ignore_errors=True)
+                for row in cursor.fetchall():
+                    note_id, fields, tags = row
+                    # Split fields (typically separated by \x1f character in Anki)
+                    fields_list = fields.split('\x1f')
+                    
+                    # Assuming first field is front (sentence + audio) and second is back (translation)
+                    if len(fields_list) >= 2:
+                        # Extract audio file name if present
+                        front = fields_list[0]
+                        audio_file = None
+                        if '[sound:' in front:
+                            import re
+                            audio_match = re.search(r'\[sound:(.*?)\]', front)
+                            if audio_match:
+                                audio_file = audio_match.group(1)
+                                front = re.sub(r'\[sound:.*?\]', '', front).strip()
+                        
+                        card_data = {
+                            'id': str(note_id),  # Convert to string to ensure JSON serializable
+                            'front': front.strip(),
+                            'back': fields_list[1].strip(),
+                            'audio_file': audio_file,
+                            'tags': tags,
+                            'due': datetime.now().isoformat()  # Add a default due date
+                        }
+                        cards.append(card_data)
+                
+            except sqlite3.Error as e:
+                st.error(f"Database error: {str(e)}")
+                return []
+            finally:
+                conn.close()
+            
+            # Handle media files if they exist
+            media_file = os.path.join(temp_dir, "media")
+            if os.path.exists(media_file):
+                try:
+                    with open(media_file, 'r') as f:
+                        media_dict = json.load(f)
+                        # Store media information in session state for later use
+                        st.session_state.media_files = media_dict
+                except json.JSONDecodeError:
+                    st.warning("Could not parse media file information")
+                except Exception as e:
+                    st.warning(f"Error processing media files: {str(e)}")
+            
+        except zipfile.BadZipFile:
+            st.error("Invalid .apkg file: The file is not a valid Anki deck package")
+            return []
+        except Exception as e:
+            st.error(f"Error processing Anki deck: {str(e)}")
+            return []
     
     return cards
 
@@ -93,15 +114,8 @@ def init_session_state():
         st.session_state.daily_stats = {'reviewed': 0, 'new': 0}
     if 'decks' not in st.session_state:
         st.session_state.decks = {}
-
-class Card:
-    def __init__(self, front: str, back: str, audio_path: str):
-        self.front = front
-        self.back = back
-        self.audio_path = audio_path
-        self.interval = 1
-        self.next_review = datetime.now()
-        self.ease_factor = 2.5
+    if 'media_files' not in st.session_state:
+        st.session_state.media_files = {}
 
 def load_user_data(username: str) -> Dict:
     if os.path.exists(f"data/{username}_progress.json"):
@@ -122,6 +136,15 @@ def calculate_next_review(interval: int, quality: str) -> datetime:
         return datetime.now() + timedelta(minutes=10)
     else:  # "good"
         return datetime.now() + timedelta(days=interval * 2)
+
+def get_next_card(deck: List[Dict]) -> Dict:
+    """Get the next card to review based on due date"""
+    if not deck:
+        return None
+    
+    # For now, just return the first card
+    # In a full implementation, you'd want to sort by due date and handle new vs review cards
+    return deck[0]
 
 def main():
     st.set_page_config(page_title="🎧 Listening Practice", layout="wide")
@@ -151,13 +174,17 @@ def main():
     # Deck Upload Section in Sidebar
     st.sidebar.markdown("### 📚 Deck Management")
     uploaded_file = st.sidebar.file_uploader("Upload Anki Deck (.apkg)", type=['apkg'])
+    
     if uploaded_file:
-        with st.sidebar.spinner("Processing deck..."):
-            cards = parse_anki_deck(uploaded_file)
-            if cards:
-                deck_name = uploaded_file.name.replace('.apkg', '')
-                st.session_state.decks[deck_name] = cards
-                st.sidebar.success(f"✅ Successfully imported {len(cards)} cards!")
+        try:
+            with st.sidebar.spinner("Processing deck..."):
+                cards = parse_anki_deck(uploaded_file)
+                if cards:
+                    deck_name = uploaded_file.name.replace('.apkg', '')
+                    st.session_state.decks[deck_name] = cards
+                    st.sidebar.success(f"✅ Successfully imported {len(cards)} cards!")
+        except Exception as e:
+            st.sidebar.error(f"Error uploading deck: {str(e)}")
     
     # Deck Selection
     if st.session_state.decks:
@@ -187,39 +214,35 @@ def main():
     
     with col1:
         st.markdown("### Current Card")
-        current_cards = st.session_state.decks[st.session_state.current_deck]
-        if current_cards:
-            current_card = current_cards[0]  # For demonstration, you'd want to implement proper card selection
+        if st.session_state.current_deck and st.session_state.decks[st.session_state.current_deck]:
+            current_card = get_next_card(st.session_state.decks[st.session_state.current_deck])
             
-            st.markdown(f"**Translation:** {current_card['back']}")  # Show translation (hidden in real app)
-            
-            if current_card['audio_file']:
-                if st.button("▶️ Play Audio"):
-                    # Handle audio playback
-                    st.audio(current_card['audio_file'])
-            
-            user_input = st.text_area("Type what you hear:", height=100)
-            
-            col_again, col_good = st.columns(2)
-            with col_again:
-                if st.button("🔄 Again", use_container_width=True):
-                    st.session_state.daily_stats['reviewed'] += 1
-                    # Update card scheduling logic here
-            with col_good:
-                if st.button("✅ Good", use_container_width=True):
-                    st.session_state.daily_stats['reviewed'] += 1
-                    # Update card scheduling logic here
+            if current_card:
+                st.markdown(f"**Translation:** {current_card['back']}")
+                
+                if current_card['audio_file']:
+                    if st.button("▶️ Play Audio"):
+                        # Here you would implement actual audio playback
+                        st.info(f"Audio file: {current_card['audio_file']}")
+                
+                user_input = st.text_area("Type what you hear:", height=100)
+                
+                col_again, col_good = st.columns(2)
+                with col_again:
+                    if st.button("🔄 Again", use_container_width=True):
+                        st.session_state.daily_stats['reviewed'] += 1
+                with col_good:
+                    if st.button("✅ Good", use_container_width=True):
+                        st.session_state.daily_stats['reviewed'] += 1
 
     with col2:
         st.markdown("### Daily Progress")
         st.metric("Reviews Done", f"{st.session_state.daily_stats['reviewed']}/{daily_review}")
         st.metric("New Cards", f"{st.session_state.daily_stats['new']}/{daily_new}")
         
-        # Progress bar
         progress = st.session_state.daily_stats['reviewed'] / daily_review
         st.progress(progress)
         
-        # Deck Statistics
         if st.session_state.current_deck:
             st.markdown("### Deck Statistics")
             total_cards = len(st.session_state.decks[st.session_state.current_deck])
